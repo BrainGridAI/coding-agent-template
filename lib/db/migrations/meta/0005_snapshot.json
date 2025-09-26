@@ -39,6 +39,20 @@
           "primaryKey": false,
           "notNull": false
         },
+        "install_dependencies": {
+          "name": "install_dependencies",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false,
+          "default": false
+        },
+        "max_duration": {
+          "name": "max_duration",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "default": 5
+        },
         "status": {
           "name": "status",
           "type": "text",

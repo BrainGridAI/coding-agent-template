@@ -16,9 +16,20 @@ export async function executeAgentInSandbox(
   sandbox: Sandbox,
   instruction: string,
   agentType: AgentType,
-  logger?: TaskLogger,
+  logger: TaskLogger,
   selectedModel?: string,
+  onCancellationCheck?: () => Promise<boolean>,
 ): Promise<AgentExecutionResult> {
+  // Check for cancellation before starting agent execution
+  if (onCancellationCheck && (await onCancellationCheck())) {
+    await logger.info('Task was cancelled before agent execution')
+    return {
+      success: false,
+      error: 'Task was cancelled',
+      cliName: agentType,
+      changesDetected: false,
+    }
+  }
   switch (agentType) {
     case 'claude':
       return executeClaudeInSandbox(sandbox, instruction, logger, selectedModel)

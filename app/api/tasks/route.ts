@@ -6,6 +6,7 @@ import { generateId } from '@/lib/utils/id'
 import { createSandbox } from '@/lib/sandbox/creation'
 import { executeAgentInSandbox, AgentType } from '@/lib/sandbox/agents'
 import { pushChangesToBranch, shutdownSandbox } from '@/lib/sandbox/git'
+import { registerSandbox, unregisterSandbox } from '@/lib/sandbox/sandbox-registry'
 import { eq, desc, or } from 'drizzle-orm'
 import { createInfoLog } from '@/lib/utils/logging'
 import { createTaskLogger } from '@/lib/utils/task-logger'
@@ -32,7 +33,7 @@ export async function POST(request: NextRequest) {
       id: taskId,
       status: 'pending',
       progress: 0,
-      logs: [createInfoLog('Task created, preparing to start...')],
+      logs: [],
     })
 
     // Insert the task into the database - ensure id is definitely present
@@ -115,6 +116,8 @@ export async function POST(request: NextRequest) {
       validatedData.repoUrl || '',
       validatedData.selectedAgent || 'claude',
       validatedData.selectedModel,
+      validatedData.installDependencies || false,
+      validatedData.maxDuration || 5,
     )
 
     return NextResponse.json({ task: newTask })
@@ -130,6 +133,8 @@ async function processTaskWithTimeout(
   repoUrl: string,
   selectedAgent: string = 'claude',
   selectedModel?: string,
+  installDependencies: boolean = false,
+  maxDuration: number = 5,
 ) {
   const TASK_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes in milliseconds
 
@@ -153,7 +158,10 @@ async function processTaskWithTimeout(
   })
 
   try {
-    await Promise.race([processTask(taskId, prompt, repoUrl, selectedAgent, selectedModel), timeoutPromise])
+    await Promise.race([
+      processTask(taskId, prompt, repoUrl, selectedAgent, selectedModel, installDependencies, maxDuration),
+      timeoutPromise,
+    ])
 
     // Clear the warning timeout if task completes successfully
     clearTimeout(warningTimeout)
@@ -199,12 +207,25 @@ async function waitForBranchName(taskId: string, maxWaitMs: number = 10000): Pro
   return null
 }
 
+// Helper function to check if task was stopped
+async function isTaskStopped(taskId: string): Promise<boolean> {
+  try {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
+    return task?.status === 'stopped'
+  } catch (error) {
+    console.error('Error checking task status:', error)
+    return false
+  }
+}
+
 async function processTask(
   taskId: string,
   prompt: string,
   repoUrl: string,
   selectedAgent: string = 'claude',
   selectedModel?: string,
+  installDependencies: boolean = false,
+  maxDuration: number = 5,
 ) {
   let sandbox: Sandbox | null = null
   const logger = createTaskLogger(taskId)
@@ -214,9 +235,20 @@ async function processTask(
     await logger.updateStatus('processing', 'Task created, preparing to start...')
     await logger.updateProgress(10, 'Initializing task execution...')
 
+    // Check if task was stopped before we even start
+    if (await isTaskStopped(taskId)) {
+      await logger.info('Task was stopped before execution began')
+      return
+    }
+
     // Wait for AI-generated branch name (with timeout)
-    await logger.updateProgress(12, 'Waiting for AI-generated branch name...')
     const aiBranchName = await waitForBranchName(taskId, 10000)
+
+    // Check if task was stopped during branch name generation
+    if (await isTaskStopped(taskId)) {
+      await logger.info('Task was stopped during branch name generation')
+      return
+    }
 
     if (aiBranchName) {
       await logger.info(`Using AI-generated branch name: ${aiBranchName}`)
@@ -227,42 +259,56 @@ async function processTask(
     await logger.updateProgress(15, 'Creating sandbox environment...')
 
     // Create sandbox with progress callback and 5-minute timeout
-    const sandboxResult = await createSandbox({
-      repoUrl,
-      timeout: '5m',
-      ports: [3000],
-      runtime: 'node22',
-      resources: { vcpus: 4 },
-      taskPrompt: prompt,
-      selectedAgent,
-      selectedModel,
-      preDeterminedBranchName: aiBranchName || undefined,
-      onProgress: async (progress: number, message: string) => {
-        // Use real-time logger for progress updates
-        await logger.updateProgress(progress, message)
+    const sandboxResult = await createSandbox(
+      {
+        taskId,
+        repoUrl,
+        timeout: `${maxDuration}m`,
+        ports: [3000],
+        runtime: 'node22',
+        resources: { vcpus: 4 },
+        taskPrompt: prompt,
+        selectedAgent,
+        selectedModel,
+        installDependencies,
+        preDeterminedBranchName: aiBranchName || undefined,
+        onProgress: async (progress: number, message: string) => {
+          // Use real-time logger for progress updates
+          await logger.updateProgress(progress, message)
+        },
+        onCancellationCheck: async () => {
+          // Check if task was stopped
+          return await isTaskStopped(taskId)
+        },
       },
-    })
+      logger,
+    )
 
     if (!sandboxResult.success) {
+      if (sandboxResult.cancelled) {
+        // Task was cancelled, this should result in stopped status, not error
+        await logger.info('Task was cancelled during sandbox creation')
+        return
+      }
       throw new Error(sandboxResult.error || 'Failed to create sandbox')
+    }
+
+    // Check if task was stopped during sandbox creation
+    if (await isTaskStopped(taskId)) {
+      await logger.info('Task was stopped during sandbox creation')
+      // Clean up sandbox if it was created
+      if (sandboxResult.sandbox) {
+        try {
+          await shutdownSandbox(sandboxResult.sandbox)
+        } catch (error) {
+          console.error('Failed to cleanup sandbox after stop:', error)
+        }
+      }
+      return
     }
 
     const { sandbox: createdSandbox, domain, branchName } = sandboxResult
     sandbox = createdSandbox || null
-
-    // Log sandbox creation completion and append sandbox logs
-    await logger.success('Sandbox created successfully')
-
-    // Append sandbox logs to database in real-time
-    for (const log of sandboxResult.logs || []) {
-      if (log.startsWith('$ ')) {
-        await logger.command(log.substring(2)) // Remove "$ " prefix
-      } else if (log.startsWith('Error: ')) {
-        await logger.error(log)
-      } else {
-        await logger.info(log)
-      }
-    }
 
     // Update sandbox URL and branch name (only update branch name if not already set by AI)
     const updateData: { sandboxUrl?: string; updatedAt: Date; branchName?: string } = {
@@ -276,6 +322,12 @@ async function processTask(
     }
 
     await db.update(tasks).set(updateData).where(eq(tasks.id, taskId))
+
+    // Check if task was stopped before agent execution
+    if (await isTaskStopped(taskId)) {
+      await logger.info('Task was stopped before agent execution')
+      return
+    }
 
     // Log agent execution start
     await logger.updateProgress(50, `Installing and executing ${selectedAgent} agent...`)
@@ -325,30 +377,27 @@ async function processTask(
 
       // Push changes to branch
       const commitMessage = `${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}`
-      const pushResult = await pushChangesToBranch(sandbox!, branchName!, commitMessage)
+      const pushResult = await pushChangesToBranch(sandbox!, branchName!, commitMessage, logger)
 
-      // Append push result logs in real-time
-      for (const log of pushResult.logs || []) {
-        if (log.startsWith('$ ')) {
-          await logger.command(log.substring(2)) // Remove "$ " prefix
-        } else if (log.startsWith('Error: ')) {
-          await logger.error(log)
-        } else {
-          await logger.info(log)
-        }
-      }
-
-      // Shutdown sandbox
-      const shutdownResult = await shutdownSandbox()
+      // Unregister and shutdown sandbox
+      unregisterSandbox(taskId)
+      const shutdownResult = await shutdownSandbox(sandbox!)
       if (shutdownResult.success) {
         await logger.success('Sandbox shutdown completed')
       } else {
         await logger.error(`Sandbox shutdown failed: ${shutdownResult.error}`)
       }
 
-      // Update task as completed
-      await logger.updateStatus('completed')
-      await logger.updateProgress(100, 'Task completed successfully')
+      // Check if push failed and handle accordingly
+      if (pushResult.pushFailed) {
+        await logger.updateStatus('error')
+        await logger.error('Task failed: Unable to push changes to repository')
+        throw new Error('Failed to push changes to repository')
+      } else {
+        // Update task as completed
+        await logger.updateStatus('completed')
+        await logger.updateProgress(100, 'Task completed successfully')
+      }
     } else {
       // Agent failed, but we still want to capture its logs
       await logger.error(`${selectedAgent} agent execution failed`)
@@ -364,7 +413,8 @@ async function processTask(
     // Try to shutdown sandbox even on error
     if (sandbox) {
       try {
-        const shutdownResult = await shutdownSandbox()
+        unregisterSandbox(taskId)
+        const shutdownResult = await shutdownSandbox(sandbox)
         if (shutdownResult.success) {
           await logger.info('Sandbox shutdown completed after error')
         } else {
@@ -394,7 +444,7 @@ export async function DELETE(request: NextRequest) {
     }
 
     const actions = action.split(',').map((a) => a.trim())
-    const validActions = ['completed', 'failed']
+    const validActions = ['completed', 'failed', 'stopped']
     const invalidActions = actions.filter((a) => !validActions.includes(a))
 
     if (invalidActions.length > 0) {
@@ -414,6 +464,9 @@ export async function DELETE(request: NextRequest) {
     if (actions.includes('failed')) {
       conditions.push(eq(tasks.status, 'error'))
     }
+    if (actions.includes('stopped')) {
+      conditions.push(eq(tasks.status, 'stopped'))
+    }
 
     if (conditions.length === 0) {
       return NextResponse.json({ error: 'No valid actions specified' }, { status: 400 })
@@ -432,6 +485,10 @@ export async function DELETE(request: NextRequest) {
     if (actions.includes('failed')) {
       const failedCount = deletedTasks.filter((task) => task.status === 'error').length
       if (failedCount > 0) actionMessages.push(`${failedCount} failed`)
+    }
+    if (actions.includes('stopped')) {
+      const stoppedCount = deletedTasks.filter((task) => task.status === 'stopped').length
+      if (stoppedCount > 0) actionMessages.push(`${stoppedCount} stopped`)
     }
 
     const message =

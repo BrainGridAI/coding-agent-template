@@ -6,6 +6,8 @@ CREATE TABLE "coding-agent"."tasks" (
 	"repo_url" text,
 	"selected_agent" text DEFAULT 'claude',
 	"selected_model" text,
+	"install_dependencies" boolean DEFAULT false,
+	"max_duration" integer DEFAULT 5,
 	"status" text DEFAULT 'pending' NOT NULL,
 	"progress" integer DEFAULT 0,
 	"logs" jsonb,
