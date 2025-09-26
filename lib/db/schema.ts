@@ -1,5 +1,8 @@
-import { pgTable, text, timestamp, integer, jsonb } from 'drizzle-orm/pg-core'
+import { pgTable, text, timestamp, integer, jsonb, pgSchema } from 'drizzle-orm/pg-core'
 import { z } from 'zod'
+
+// Define the coding-agent schema
+export const codingAgentSchema = pgSchema('coding-agent')
 
 // Log entry types
 export const logEntrySchema = z.object({
@@ -10,7 +13,7 @@ export const logEntrySchema = z.object({
 
 export type LogEntry = z.infer<typeof logEntrySchema>
 
-export const tasks = pgTable('tasks', {
+export const tasks = codingAgentSchema.table('tasks', {
   id: text('id').primaryKey(),
   prompt: text('prompt').notNull(),
   repoUrl: text('repo_url'),
